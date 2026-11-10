@@ -1,0 +1,236 @@
+# 发布流水线：tag v* 或手动触发。三架构静态 musl 构建（x86_64 / aarch64 走
+# 原生 runner，loongarch64 用 cargo-zigbuild 交叉；交叉任务在宿主机生成 shell
+# 补全后交给 spec，不依赖 qemu/binfmt）→ 产出 RPM
+# 三件套（spec 的 prebuilt_dir 路径，%%build 不再重复编译）+ src.rpm +
+# 裸静态二进制 tar.gz，汇入同一个 GitHub Release。版本号取自 Cargo.toml，
+# 不在这里维护第二份。
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: x86_64
+            runner: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            method: native
+            rpm_target: ""
+          - name: aarch64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            method: native
+            rpm_target: ""
+          - name: loongarch64
+            runner: ubuntu-latest
+            target: loongarch64-unknown-linux-musl
+            method: zigbuild
+            rpm_target: loongarch64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: host deps
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo apt-get update || (sleep 15 && sudo apt-get update)
+          sudo apt-get install -y --no-install-recommends rpm
+
+      - name: musl toolchain
+        if: matrix.method == 'native'
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: sudo apt-get install -y --no-install-recommends musl-tools
+
+      # nc powers the forward/reverse endpoint probes in e2e; the runner
+      # image may not ship it
+      - name: e2e tools
+        if: matrix.name == 'x86_64'
+        run: sudo apt-get install -y --no-install-recommends netcat-openbsd iputils-ping
+
+      - if: matrix.method == 'zigbuild'
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - if: matrix.method == 'zigbuild'
+        run: cargo install cargo-zigbuild --locked
+
+      - name: unit tests
+        if: matrix.method == 'native'
+        # 串行跑测试：共享 ARM runner 核数少，argon2 校验这类重 CPU 测试与
+        # 心跳窗口类时序测试并行时会互相饿死，把后者打出超时（实测偶发）。
+        # 串行代价是个位数秒，换 CI 稳定。
+        env:
+          RUST_TEST_THREADS: "1"
+        run: cargo test --workspace --locked
+
+      - name: musl release build
+        run: |
+          if [ "${{ matrix.method }}" = native ]; then
+            cargo build --release --locked --target ${{ matrix.target }}
+          else
+            cargo zigbuild --release --locked --target ${{ matrix.target }}
+          fi
+
+      - name: e2e loopback
+        if: matrix.name == 'x86_64'
+        shell: bash {0}
+        run: |
+          log="$RUNNER_TEMP/e2e.out"
+          # environment fingerprint; attached to the diag artifact on failure
+          {
+            echo "uname: $(uname -a)"
+            echo "bash: $(bash --version | head -1)"
+            echo "sh: $(ls -la /bin/sh 2>&1)"
+            echo "python3: $(command -v python3 || echo MISSING) $(python3 --version 2>&1)"
+            echo "nc: $(command -v nc || echo MISSING) $(nc -h 2>&1 | head -1)"
+            echo "openssl: $(command -v openssl || echo MISSING) $(openssl version 2>&1)"
+            echo "curl: $(command -v curl || echo MISSING)"
+            echo "sha256sum: $(command -v sha256sum || echo MISSING)"
+            echo "shasum: $(command -v shasum || echo MISSING)"
+            echo "XDG_CONFIG_HOME=${XDG_CONFIG_HOME:-<unset>}"
+            echo "HOME=$HOME USER=$(id -un 2>/dev/null)"
+          } > "$RUNNER_TEMP/e2e-env.txt" 2>&1
+          if BIN="$PWD/target/${{ matrix.target }}/release" bash scripts/e2e.sh >"$log" 2>&1; then
+            tail -5 "$log"
+            exit 0
+          fi
+          # step logs are not readable without admin tokens; mirror the failure
+          # into check annotations and a diag artifact (uploaded even though
+          # this step fails)
+          grep -E '^(FAIL \||error:)' "$log" | head -20 | while IFS= read -r l; do
+            echo "::error::$l"
+          done
+          d=$(sed -n 's/.*dir \(\/tmp\/exvia-e2e-[^ )]*\).*/\1/p' "$log" | head -1)
+          {
+            echo "run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            echo "ref: $GITHUB_REF_NAME @ $GITHUB_SHA"
+            echo
+            echo '```text'
+            cat "$RUNNER_TEMP/e2e-env.txt"
+            echo '```'
+            echo
+            echo '```text'
+            cat "$log"
+            echo '```'
+            for f in relay.log agent.log cargo-test.log; do
+              if [ -n "$d" ] && [ -f "$d/$f" ]; then
+                echo; echo "### $f (tail 80)"; echo '```text'
+                tail -80 "$d/$f"
+                echo '```'
+              fi
+            done
+          } > "$GITHUB_WORKSPACE/e2e-diag.md"
+          exit 1
+
+      - name: upload e2e diag
+        if: always() && matrix.name == 'x86_64'
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-diag
+          if-no-files-found: ignore
+          path: e2e-diag.md
+
+      - name: shell completions (host build)
+        # completions are plain shell text; generating them with a host build
+        # keeps cross jobs free of binfmt/qemu on the runner
+        if: matrix.method == 'zigbuild'
+        run: |
+          mkdir -p "$HOME/completions"
+          cargo run --quiet --locked --bin exvia -- completion bash > "$HOME/completions/exvia.bash"
+          cargo run --quiet --locked --bin exvia -- completion zsh > "$HOME/completions/_exvia"
+          cargo run --quiet --locked --bin exvia -- completion fish > "$HOME/completions/exvia.fish"
+
+      - name: strip
+        run: |
+          for b in exvia exvia-agent exvia-relay; do
+            strip "target/${{ matrix.target }}/release/$b" || true
+          done
+
+      - name: version
+        id: meta
+        run: echo "version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)" >> "$GITHUB_OUTPUT"
+
+      - name: binary tarball
+        run: |
+          tar czf "exvia-${{ steps.meta.outputs.version }}-${{ matrix.name }}-linux-musl.tar.gz" \
+            -C "target/${{ matrix.target }}/release" exvia exvia-agent exvia-relay
+
+      - name: rpms
+        run: |
+          topdir="$HOME/rpmbuild"
+          mkdir -p "$topdir"/{SOURCES,SPECS,BUILD,RPMS,SRPMS}
+          # target/ holds the prebuilt binaries; it is fed in via an absolute
+          # prebuilt_dir below, so the source tarball (and src.rpm) stay small
+          tar czf "$topdir/SOURCES/exvia-${{ steps.meta.outputs.version }}.tar.gz" \
+            --exclude=.git --exclude=target --transform "s,^,exvia-${{ steps.meta.outputs.version }}/," .
+          # --nodeps: BuildRequires (cargo/gcc) describe the source-build path;
+          # this job feeds prebuilt binaries, and the runner has no RPM cargo
+          defines=(
+            --define "_topdir $topdir"
+            --define "prebuilt_dir $GITHUB_WORKSPACE/target/${{ matrix.target }}/release"
+            --define "dist .musl"
+          )
+          if [ "${{ matrix.method }}" = zigbuild ]; then
+            defines+=(--define "completions_dir $HOME/completions")
+          fi
+          rpmbuild -ba exvia.spec --nodeps "${defines[@]}" \
+            ${{ matrix.rpm_target != '' && format('--target {0}', matrix.rpm_target) || '' }}
+
+      - name: stage artifacts
+        run: |
+          # upload-artifact roots multi-path uploads at the least common
+          # ancestor; staging everything into one workspace directory keeps
+          # every file at the artifact root, so the release glob sees them
+          mkdir -p dist-assets
+          cp -a "$HOME"/rpmbuild/RPMS/*/*.rpm dist-assets/
+          cp -a exvia-*-linux-musl.tar.gz dist-assets/
+
+      - name: upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: dist-assets
+
+      - name: upload src.rpm (x86_64)
+        if: matrix.name == 'x86_64'
+        uses: actions/upload-artifact@v4
+        with:
+          name: srpms
+          path: ~/rpmbuild/SRPMS/*.src.rpm
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+          path: dist
+      - name: publish
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          generate_release_notes: true

@@ -1,0 +1,17 @@
+/target
+.DS_Store
+*.sqlite3
+
+# 构建产物（make srpm 输出），不入库
+/dist/
+
+# 运行期数据与身份文件，永远不该提交
+relay-data/
+*.identity
+identity.json
+cli-identity.json
+client.json
+trusted-cli.json
+aliases.json
+machines-cache.json
+admin-token.txt

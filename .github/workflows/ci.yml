@@ -1,0 +1,31 @@
+# exvia CI：fmt + clippy 只在 stable 腿跑（地板腿组件版本可能滞后，fmt/clippy
+# 口径有漂移风险）；--locked 使用入库的 Cargo.lock，不在 CI 里重新解析依赖。
+# 地板工具链见 Cargo.toml rust-version。
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        toolchain: [stable, "1.85"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.toolchain }}
+          components: rustfmt,clippy
+      - if: matrix.toolchain == 'stable'
+        run: cargo fmt --all --check
+      - if: matrix.toolchain == 'stable'
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      # 串行跑测试：与 release.yml 同一理由（重 CPU 测试与时序测试并行互饿，
+      # 共享 runner 上偶发超时）；代价是个位数秒。
+      - env:
+          RUST_TEST_THREADS: "1"
+        run: cargo test --workspace --locked

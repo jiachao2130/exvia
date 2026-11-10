@@ -1,0 +1,44 @@
+[package]
+name = "exvia-proto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "exvia 协议核心：控制消息、L3 帧编解码、密钥管理、Noise 加密流、WS 字节适配"
+
+[dependencies]
+tokio = { workspace = true }
+futures = { workspace = true }
+bytes = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+
+tokio-tungstenite = { workspace = true }
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+rcgen = { workspace = true }
+time = { workspace = true }
+
+yamux = { workspace = true }
+tokio-util = { workspace = true }
+snow = { workspace = true }
+
+ed25519-dalek = { workspace = true }
+x25519-dalek = { workspace = true }
+rand = { workspace = true }
+
+sha2 = { workspace = true }
+hex = { workspace = true }
+base64 = { workspace = true }
+libc = { workspace = true }
+
+axum = { workspace = true, optional = true }
+
+[features]
+axum-ws = ["dep:axum"]
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
